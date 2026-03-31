@@ -1,0 +1,115 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build and test artifacts
+build/
+dist/
+site/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Logs and temporary files
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Training/runtime artifacts
+wandb/
+.wandb/
+runs/
+tensorboard/
+mlruns/
+lightning_logs/
+.gradio/
+flagged/
+outputs/
+output/
+results/
+save_results/
+generated/
+samples/
+checkpoints/
+weights/
+pretrained/
+
+# Large model/data files
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+*.lmdb
+*.mdb
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.parquet
+*.arrow
+*.feather
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.zip
+*.7z
+*.rar
+*.gz
+*.bz2
+
+# Requested blanket filters
+*.txt
+*.csv
+
+# Secrets
+*.pem
+*.key
+secrets.yaml
+secrets.json
+credentials.json
+
+# Project-specific generated paths
+LTX-2/packages/CausVid/distillation_data/
+LTX-2/packages/Self-Forcing/checkpoints/
+LTX-2/eval/outputs/
+LightX2V/save_results/
+
+# Keep repository metadata/docs
+!.gitignore
+!.gitkeep
+!README*.md
+!LICENSE*

@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+.python-version
+
+# Editors
+.idea/
+.vscode/
+
+# Runtime artifacts
+.wandb/
+wandb/
+tmp/
+checkpoints/
+
+# Model/data artifacts
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.sft
+*.lmdb
+*.mdb
+
+# Requested blanket filters
+*.txt
+*.csv
+
+# Generated outputs
+eval/outputs/
+
+# Keep repository metadata/docs
+!.gitignore
+!README*.md
+!LICENSE*
