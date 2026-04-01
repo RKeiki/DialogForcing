@@ -89,6 +89,7 @@ def fsdp_wrap(
     transformer_module: Optional[Tuple[type, ...]] = None,
     min_num_params: int = 1e8,
     cpu_offload: bool = False,
+    process_group: Optional[Any] = None,
 ) -> FSDP:
     """
     Wrap module with FSDP for distributed training.
@@ -101,6 +102,7 @@ def fsdp_wrap(
         transformer_module: Transformer block classes for transformer wrapping
         min_num_params: Minimum parameters for size-based wrapping
         cpu_offload: Enable CPU offload
+        process_group: Optional process group for subgroup-scoped FSDP
 
     Returns:
         FSDP-wrapped module
@@ -140,6 +142,7 @@ def fsdp_wrap(
         mixed_precision=mp_policy,
         auto_wrap_policy=wrap_policy,
         cpu_offload=offload_policy,
+        process_group=process_group,
         device_id=torch.cuda.current_device(),
         use_orig_params=True,
     )

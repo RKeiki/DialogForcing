@@ -21,6 +21,7 @@ from ltx_core.loader.registry import StateDictRegistry
 
 from ltx_core.components.schedulers import LTX2Scheduler
 
+from ltx_distillation.distributed_topology import DistributedTopology
 from ltx_distillation.models.ltx_wrapper import LTX2DiffusionWrapper, create_ltx2_wrapper
 from ltx_distillation.models.text_encoder_wrapper import GemmaTextEncoderWrapper, create_text_encoder_wrapper
 from ltx_distillation.models.vae_wrapper import VideoVAEWrapper, AudioVAEWrapper, create_vae_wrappers
@@ -57,7 +58,12 @@ class LTX2DMD(nn.Module):
     VIDEO_LATENT_FPS = 3.0  # 24fps / 8
     AUDIO_LATENT_FPS = 25.0  # 16kHz / 160 / 4
 
-    def __init__(self, args, device: torch.device):
+    def __init__(
+        self,
+        args,
+        device: torch.device,
+        topology: Optional[DistributedTopology] = None,
+    ):
         """
         Initialize the DMD module.
 
@@ -81,6 +87,7 @@ class LTX2DMD(nn.Module):
         self.args = args
         self.device = device
         self.dtype = torch.bfloat16 if args.mixed_precision else torch.float32
+        self.topology = topology
 
         # Task types
         self.generator_task_type = getattr(args, "generator_task_type", args.generator_task)
@@ -154,6 +161,7 @@ class LTX2DMD(nn.Module):
         self.text_encoder: GemmaTextEncoderWrapper = None
         self.video_vae: VideoVAEWrapper = None
         self.audio_vae: AudioVAEWrapper = None
+        self.real_score_client = None
 
         # DMD hyperparameters
         self.num_train_timestep = args.num_train_timestep
@@ -297,6 +305,19 @@ class LTX2DMD(nn.Module):
         Models must exist before they can be wrapped with FSDP.
         """
         args = self.args
+        role = self.topology.role if self.topology is not None else "worker"
+        load_generator = role != "teacher"
+        load_real_score = role != "worker" or not (self.topology and self.topology.enabled)
+        load_fake_score = role != "teacher"
+        load_text_encoder = not (self.topology and self.topology.enabled and role == "worker")
+        load_vae = not (self.topology and self.topology.enabled)
+        topology_enabled = self.topology is not None and self.topology.enabled
+        effective_sharding_strategy = str(getattr(args, "sharding_strategy", "")).lower()
+        if topology_enabled and effective_sharding_strategy in {"hybrid_full", "hybrid_grad_op"}:
+            if role == "teacher":
+                effective_sharding_strategy = "full_shard"
+            elif getattr(self.topology, "num_worker_groups", 1) <= 1:
+                effective_sharding_strategy = "full_shard"
 
         def _init_log(message: str) -> None:
             if not dist.is_initialized() or dist.get_rank() == 0:
@@ -317,14 +338,15 @@ class LTX2DMD(nn.Module):
             getattr(
                 args,
                 "init_models_on_cpu",
-                str(getattr(args, "sharding_strategy", "")).lower() == "full_shard",
+                effective_sharding_strategy == "full_shard",
             )
         )
         init_device: torch.device | str = torch.device("cpu") if init_on_cpu else self.device
         target_device = "cpu" if init_on_cpu else runtime_device
         _init_log(
             f"model init device={'cpu' if init_on_cpu else runtime_device} "
-            f"(sharding={getattr(args, 'sharding_strategy', 'unknown')})"
+            f"(configured_sharding={getattr(args, 'sharding_strategy', 'unknown')}, "
+            f"effective_sharding={effective_sharding_strategy})"
         )
 
         def _load_checkpoint_state_dict(checkpoint_path: str) -> dict:
@@ -495,47 +517,60 @@ class LTX2DMD(nn.Module):
 
         checkpoint_state_cache: Dict[str, dict] = {}
         shared_registry = StateDictRegistry()
-        _init_log("generator wrapper init start")
-        self.generator = _build_wrapper(self.generator_use_causal_wrapper)
-        _init_log("generator wrapper init done")
-        _init_log("real_score wrapper init start")
-        self.real_score = _build_wrapper(self.real_score_use_causal_wrapper)
-        _init_log("real_score wrapper init done")
-        _init_log("fake_score wrapper init start")
-        self.fake_score = _build_wrapper(self.fake_score_use_causal_wrapper)
-        _init_log("fake_score wrapper init done")
+        if load_generator:
+            _init_log("generator wrapper init start")
+            self.generator = _build_wrapper(self.generator_use_causal_wrapper)
+            _init_log("generator wrapper init done")
+        if load_real_score:
+            _init_log("real_score wrapper init start")
+            self.real_score = _build_wrapper(self.real_score_use_causal_wrapper)
+            _init_log("real_score wrapper init done")
+        if load_fake_score:
+            _init_log("fake_score wrapper init start")
+            self.fake_score = _build_wrapper(self.fake_score_use_causal_wrapper)
+            _init_log("fake_score wrapper init done")
 
-        _init_log("text encoder init start")
-        self.text_encoder = create_text_encoder_wrapper(
-            checkpoint_path=args.checkpoint_path,
-            gemma_path=args.gemma_path,
-            device=init_device,
-            dtype=self.dtype,
-            #registry=shared_registry,
-        )
-        _init_log("text encoder init done")
+        if load_text_encoder:
+            _init_log("text encoder init start")
+            self.text_encoder = create_text_encoder_wrapper(
+                checkpoint_path=args.checkpoint_path,
+                gemma_path=args.gemma_path,
+                device=init_device,
+                dtype=self.dtype,
+                #registry=shared_registry,
+            )
+            _init_log("text encoder init done")
 
-        _init_log("vae init start")
-        self.video_vae, self.audio_vae = create_vae_wrappers(
-            checkpoint_path=args.checkpoint_path,
-            device=init_device,
-            dtype=self.dtype,
-            #registry=shared_registry,
-        )
-        _init_log("vae init done")
+        if load_vae:
+            _init_log("vae init start")
+            self.video_vae, self.audio_vae = create_vae_wrappers(
+                checkpoint_path=args.checkpoint_path,
+                device=init_device,
+                dtype=self.dtype,
+                #registry=shared_registry,
+            )
+            _init_log("vae init done")
 
         # Set gradients
-        self.generator.set_module_grad(args.generator_grad)
-        self.real_score.set_module_grad(args.real_score_grad)
-        self.fake_score.set_module_grad(args.fake_score_grad)
-        self.text_encoder.requires_grad_(False)
-        self.video_vae.requires_grad_(False)
-        self.audio_vae.requires_grad_(False)
+        if self.generator is not None:
+            self.generator.set_module_grad(args.generator_grad)
+        if self.real_score is not None:
+            self.real_score.set_module_grad(args.real_score_grad)
+        if self.fake_score is not None:
+            self.fake_score.set_module_grad(args.fake_score_grad)
+        if self.text_encoder is not None:
+            self.text_encoder.requires_grad_(False)
+        if self.video_vae is not None:
+            self.video_vae.requires_grad_(False)
+        if self.audio_vae is not None:
+            self.audio_vae.requires_grad_(False)
 
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
-            self.generator.enable_gradient_checkpointing()
-            self.fake_score.enable_gradient_checkpointing()
+            if self.generator is not None:
+                self.generator.enable_gradient_checkpointing()
+            if self.fake_score is not None:
+                self.fake_score.enable_gradient_checkpointing()
 
         # Checkpoint loading with priority:
         #   resume_checkpoint > generator_ckpt > stage1_ckpt_path
@@ -544,7 +579,7 @@ class LTX2DMD(nn.Module):
         generator_ckpt = getattr(args, "generator_ckpt", None)
         generator_ckpt_strict = getattr(args, "generator_ckpt_strict", False)
 
-        if generator_ckpt:
+        if generator_ckpt and self.generator is not None:
             print(f"Loading pretrained generator from {generator_ckpt}")
             ckpt = torch.load(generator_ckpt, map_location="cpu")
             gen_sd = ckpt.get("generator", ckpt)
@@ -572,7 +607,7 @@ class LTX2DMD(nn.Module):
                         break
             print("[Stage3] Generator checkpoint load complete")
 
-        elif stage1_ckpt:
+        elif stage1_ckpt and self.generator is not None:
             print(f"[Stage2] Loading Stage 1 checkpoint from {stage1_ckpt}")
             ckpt = torch.load(stage1_ckpt, map_location="cpu")
 
@@ -621,6 +656,53 @@ class LTX2DMD(nn.Module):
                             )
                             break
             print("[Stage2] Stage1 checkpoint load complete")
+
+    def set_real_score_client(self, client) -> None:
+        self.real_score_client = client
+
+    def _run_real_score_pair(
+        self,
+        *,
+        noisy_video: torch.Tensor,
+        noisy_audio: Optional[torch.Tensor],
+        video_sigma: torch.Tensor,
+        audio_sigma: Optional[torch.Tensor],
+        conditional_dict: Dict[str, Any],
+        unconditional_dict: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+        if self.real_score is not None:
+            pred_real_cond_video, pred_real_cond_audio = self.real_score(
+                noisy_image_or_video=noisy_video,
+                conditional_dict=conditional_dict,
+                timestep=video_sigma,
+                noisy_audio=noisy_audio,
+                audio_timestep=audio_sigma,
+            )
+            pred_real_uncond_video, pred_real_uncond_audio = self.real_score(
+                noisy_image_or_video=noisy_video,
+                conditional_dict=unconditional_dict,
+                timestep=video_sigma,
+                noisy_audio=noisy_audio,
+                audio_timestep=audio_sigma,
+            )
+            return (
+                pred_real_cond_video,
+                pred_real_cond_audio,
+                pred_real_uncond_video,
+                pred_real_uncond_audio,
+            )
+
+        if self.real_score_client is None:
+            raise RuntimeError("No local real_score model or remote real_score client is available")
+
+        return self.real_score_client.run_real_score(
+            noisy_video=noisy_video,
+            noisy_audio=noisy_audio,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+        )
 
     def _round_align(self, value: float) -> int:
         if self.alignment_rounding == "floor":
@@ -1253,20 +1335,13 @@ class LTX2DMD(nn.Module):
         Returns:
             Tuple of (pred_video_x0, pred_audio_x0)
         """
-        pred_cond_video, pred_cond_audio = self.real_score(
-            noisy_image_or_video=noisy_video,
+        pred_cond_video, pred_cond_audio, pred_uncond_video, pred_uncond_audio = self._run_real_score_pair(
+            noisy_video=noisy_video,
+            noisy_audio=noisy_audio,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
             conditional_dict=conditional_dict,
-            timestep=video_sigma,
-            noisy_audio=noisy_audio,
-            audio_timestep=audio_sigma,
-        )
-
-        pred_uncond_video, pred_uncond_audio = self.real_score(
-            noisy_image_or_video=noisy_video,
-            conditional_dict=unconditional_dict,
-            timestep=video_sigma,
-            noisy_audio=noisy_audio,
-            audio_timestep=audio_sigma,
+            unconditional_dict=unconditional_dict,
         )
 
         # CFG: output = cond + (scale - 1) * (cond - uncond)
@@ -1433,20 +1508,15 @@ class LTX2DMD(nn.Module):
         )
 
         # Step 2: Real score prediction with CFG
-        pred_real_cond_video, pred_real_cond_audio = self.real_score(
-            noisy_image_or_video=noisy_video,
-            conditional_dict=conditional_dict,
-            timestep=video_sigma,
-            noisy_audio=noisy_audio,
-            audio_timestep=audio_sigma,
-        )
-
-        pred_real_uncond_video, pred_real_uncond_audio = self.real_score(
-            noisy_image_or_video=noisy_video,
-            conditional_dict=unconditional_dict,
-            timestep=video_sigma,
-            noisy_audio=noisy_audio,
-            audio_timestep=audio_sigma,
+        pred_real_cond_video, pred_real_cond_audio, pred_real_uncond_video, pred_real_uncond_audio = (
+            self._run_real_score_pair(
+                noisy_video=noisy_video,
+                noisy_audio=noisy_audio,
+                video_sigma=video_sigma,
+                audio_sigma=audio_sigma,
+                conditional_dict=conditional_dict,
+                unconditional_dict=unconditional_dict,
+            )
         )
 
         # Apply CFG: output = cond + (scale - 1) * (cond - uncond)

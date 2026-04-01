@@ -50,7 +50,7 @@ distillation_loss: dmd
 # =============================================================================
 mixed_precision: true
 gradient_checkpointing: true
-batch_size: 4
+batch_size: 10
 
 lr: 2.0e-05
 generator_lr: 2.0e-05
@@ -86,6 +86,14 @@ video_width: 768
 # FSDP Configuration
 # =============================================================================
 sharding_strategy: full_shard
+
+# Optional split topology:
+# - false: legacy single-world training, every rank loads teacher+student+critic
+# - true: teacher lives on dedicated node(s), each worker group loads student+critic only
+# Current limitation: split_teacher_worker only supports dmd_latent_mode=direct_noise.
+split_teacher_worker: false
+teacher_num_nodes: 1
+worker_num_nodes_per_group: 1
 
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size

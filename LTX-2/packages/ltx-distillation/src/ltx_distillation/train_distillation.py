@@ -17,8 +17,10 @@ import torch.distributed as dist
 import wandb
 from omegaconf import OmegaConf
 
+from ltx_distillation.distributed_topology import build_distributed_topology
 from ltx_distillation.dmd import LTX2DMD
 from ltx_distillation.data import TextDataset, ODERegressionLMDBDataset
+from ltx_distillation.teacher_rpc import RemoteTeacherClient, RemoteTeacherService
 from ltx_distillation.util import (
     launch_distributed_job,
     set_seed,
@@ -118,10 +120,30 @@ class Trainer:
         self.global_rank = rank
         self.world_size = world_size
         self.local_rank = local_rank
+        self.topology = build_distributed_topology(
+            config=config,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+        )
 
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.device = torch.cuda.current_device()
-        self.is_main_process = self.global_rank == 0
+        self.is_main_process = self.topology.is_primary_worker_leader
+        self.is_worker = self.topology.is_worker
+        self.is_teacher = self.topology.is_teacher
+        if self.topology.enabled and getattr(config, "dmd_latent_mode", "direct_noise") != "direct_noise":
+            raise NotImplementedError(
+                "split_teacher_worker currently supports only dmd_latent_mode=direct_noise"
+            )
+        if self.global_rank == 0:
+            print(
+                "[Topology] "
+                f"enabled={self.topology.enabled} role={self.topology.role} "
+                f"teacher_ranks={self.topology.teacher_ranks} "
+                f"worker_groups={self.topology.worker_groups}",
+                flush=True,
+            )
 
         # Set seed
         if config.seed == 0:
@@ -165,15 +187,46 @@ class Trainer:
                 pass
 
         # Initialize DMD module
-        self.dmd = LTX2DMD(config, device=self.device)
+        self.dmd = LTX2DMD(config, device=self.device, topology=self.topology)
 
         # Initialize models from checkpoints BEFORE FSDP wrapping
         # Models must exist before we can wrap them with FSDP
         self.dmd.init_models()
-        self._validate_preinstalled_bidirectional_delegate()
+        if self.is_worker:
+            self._validate_preinstalled_bidirectional_delegate()
 
         # FSDP wrapping
         self._wrap_with_fsdp()
+
+        if self.is_worker and self.topology.enabled:
+            self.teacher_client = RemoteTeacherClient(self.topology, device=self.device)
+            self.dmd.set_real_score_client(self.teacher_client)
+        else:
+            self.teacher_client = None
+        self.teacher_service = None
+        if self.is_teacher:
+            self.teacher_service = RemoteTeacherService(
+                topology=self.topology,
+                device=self.device,
+                real_score_module=self.dmd.real_score,
+                text_encoder_module=self.dmd.text_encoder,
+            )
+
+        self.step = 0
+        self.max_grad_norm = getattr(config, "max_grad_norm", 10.0)
+        self.log_iters = int(getattr(config, "log_iters", 0))
+        self.layerwise_grad_log_interval = max(
+            1, int(getattr(config, "layerwise_grad_log_interval", config.log_iters))
+        )
+        self.previous_time = None
+
+        if not self.is_worker:
+            self.generator_optimizer = None
+            self.critic_optimizer = None
+            self.generator_scheduler = None
+            self.critic_scheduler = None
+            self.dataloader = None
+            return
 
         # Optimizers
         weight_decay = getattr(config, "weight_decay", 0.0)
@@ -203,14 +256,6 @@ class Trainer:
 
         # Benchmark prompts (for periodic inference visualization)
         self._init_benchmark_prompts()
-
-        self.step = 0
-        self.max_grad_norm = getattr(config, "max_grad_norm", 10.0)
-        self.log_iters = int(getattr(config, "log_iters", 0))
-        self.layerwise_grad_log_interval = max(
-            1, int(getattr(config, "layerwise_grad_log_interval", config.log_iters))
-        )
-        self.previous_time = None
 
         # Resume from a causal DMD checkpoint (full state: generator + critic + step)
         resume_ckpt = getattr(config, "resume_checkpoint", None)
@@ -278,34 +323,63 @@ class Trainer:
     def _wrap_with_fsdp(self):
         """Wrap models with FSDP for distributed training."""
         config = self.config
+        model_pg = self.topology.model_process_group
+        sharding_strategy = config.sharding_strategy
 
-        self.dmd.generator = fsdp_wrap(
-            self.dmd.generator,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy,
-        )
+        if (
+            self.topology.enabled
+            and str(sharding_strategy).lower() in {"hybrid_full", "hybrid_grad_op"}
+        ):
+            if self.is_teacher:
+                # Teacher lives on a dedicated node with no replica dimension.
+                # FSDP hybrid shard requires a (shard_pg, replica_pg) tuple, so
+                # keep teacher on a simple intra-node shard group instead.
+                sharding_strategy = "full_shard"
+            elif self.topology.worker_replica_process_group is not None:
+                model_pg = (
+                    self.topology.model_process_group,
+                    self.topology.worker_replica_process_group,
+                )
+            else:
+                # A single worker group has no replica dimension, so hybrid shard
+                # is not a valid FSDP topology. Fall back to plain full_shard.
+                sharding_strategy = "full_shard"
 
-        self.dmd.real_score = fsdp_wrap(
-            self.dmd.real_score,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy,
-        )
+        if self.dmd.generator is not None:
+            self.dmd.generator = fsdp_wrap(
+                self.dmd.generator,
+                sharding_strategy=sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.generator_fsdp_wrap_strategy,
+                process_group=model_pg,
+            )
 
-        self.dmd.fake_score = fsdp_wrap(
-            self.dmd.fake_score,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.fake_score_fsdp_wrap_strategy,
-        )
+        if self.dmd.real_score is not None:
+            self.dmd.real_score = fsdp_wrap(
+                self.dmd.real_score,
+                sharding_strategy=sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.real_score_fsdp_wrap_strategy,
+                process_group=model_pg,
+            )
 
-        self.dmd.text_encoder = fsdp_wrap(
-            self.dmd.text_encoder,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
-        )
+        if self.dmd.fake_score is not None:
+            self.dmd.fake_score = fsdp_wrap(
+                self.dmd.fake_score,
+                sharding_strategy=sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.fake_score_fsdp_wrap_strategy,
+                process_group=model_pg,
+            )
+
+        if self.dmd.text_encoder is not None:
+            self.dmd.text_encoder = fsdp_wrap(
+                self.dmd.text_encoder,
+                sharding_strategy=sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
+                process_group=model_pg,
+            )
 
         # Keep VAEs on CPU to save GPU memory during training.
         # They are only needed for periodic visualization and benchmark decoding.
@@ -318,6 +392,10 @@ class Trainer:
     def _init_dataloader(self):
         """Initialize data loader."""
         from ltx_distillation.data import collate_text_prompts, collate_ode_data
+
+        if not self.is_worker:
+            self.dataloader = None
+            return
 
         config = self.config
 
@@ -333,11 +411,20 @@ class Trainer:
             )
             collate_fn = collate_ode_data
 
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
-            shuffle=True,
-            drop_last=True,
-        )
+        if self.topology.enabled:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=self.topology.worker_global_world_size,
+                rank=self.topology.worker_global_rank,
+                shuffle=True,
+                drop_last=True,
+            )
+        else:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                shuffle=True,
+                drop_last=True,
+            )
 
         dataloader = torch.utils.data.DataLoader(
             dataset,
@@ -358,6 +445,18 @@ class Trainer:
         **All ranks** load the prompts because FSDP-wrapped models require all
         ranks to participate in forward passes during benchmark inference.
         """
+        if not self.is_worker:
+            self.benchmark_enabled = False
+            self.benchmark_prompts = []
+            return
+
+        if self.topology.enabled:
+            self.benchmark_enabled = False
+            self.benchmark_prompts = []
+            if self.is_main_process:
+                print("[Benchmark] Disabled in split_teacher_worker mode.")
+            return
+
         config = self.config
         self.benchmark_enabled = getattr(config, "benchmark_enabled", True)
         self.benchmark_iters = int(getattr(config, "benchmark_iters", config.log_iters))
@@ -426,6 +525,9 @@ class Trainer:
 
     def save(self):
         """Save checkpoint."""
+        if not self.is_worker or not self.topology.is_primary_worker_group:
+            return
+
         print("Gathering distributed model states...")
 
         generator_state_dict = fsdp_state_dict(self.dmd.generator)
@@ -488,8 +590,26 @@ class Trainer:
             f"train/{prefix}_grad_norm/{k}": math.sqrt(v) for k, v in layer_sq_norm.items()
         }
 
+    def _sync_worker_gradients(self, module) -> None:
+        sharding_strategy = str(getattr(self.config, "sharding_strategy", "")).lower()
+        if self.topology.enabled and sharding_strategy in {"hybrid_full", "hybrid_grad_op"}:
+            return
+
+        replica_pg = self.topology.worker_replica_process_group
+        if replica_pg is None:
+            return
+
+        for param in module.parameters():
+            if param.grad is None:
+                continue
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=replica_pg)
+            param.grad.div_(self.topology.num_worker_groups)
+
     def train_one_step(self):
         """Execute one training step."""
+        if not self.is_worker:
+            raise RuntimeError("train_one_step() should only be called on worker ranks")
+
         # Set all models to eval mode first (disables dropout/batchnorm),
         # then re-enable train mode for generator and fake_score so that
         # gradient checkpointing remains active during their gradient-enabled
@@ -546,20 +666,21 @@ class Trainer:
             batch_size=batch_size,
         )
 
-        # Encode text
+        # Encode text or request conditioning from the teacher side.
         with torch.no_grad():
-            conditional_dict = self.dmd.text_encoder(text_prompts=text_prompts)
-
-            if not hasattr(self, "unconditional_dict"):
+            if self.teacher_client is not None:
+                conditional_dict, unconditional_dict = self.teacher_client.request_conditioning(
+                    text_prompts=text_prompts,
+                    negative_prompt=config.negative_prompt,
+                )
+            else:
+                conditional_dict = self.dmd.text_encoder(text_prompts=text_prompts)
                 unconditional_dict = self.dmd.text_encoder(
                     text_prompts=[config.negative_prompt] * batch_size
                 )
                 unconditional_dict = {
                     k: v.detach() for k, v in unconditional_dict.items()
                 }
-                self.unconditional_dict = unconditional_dict
-            else:
-                unconditional_dict = self.unconditional_dict
 
         # Train generator
         if TRAIN_GENERATOR:
@@ -574,6 +695,7 @@ class Trainer:
 
             self.generator_optimizer.zero_grad()
             generator_loss.backward()
+            self._sync_worker_gradients(self.dmd.generator)
             generator_layerwise_grad_dict = (
                 self._compute_layerwise_grad_norms(self.dmd.generator, "generator")
                 if LOG_LAYERWISE_GRAD else {}
@@ -619,6 +741,7 @@ class Trainer:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        self._sync_worker_gradients(self.dmd.fake_score)
         critic_layerwise_grad_dict = (
             self._compute_layerwise_grad_norms(self.dmd.fake_score, "critic")
             if LOG_LAYERWISE_GRAD else {}
@@ -947,6 +1070,19 @@ class Trainer:
 
     def train(self):
         """Main training loop."""
+        if self.is_teacher:
+            while True:
+                train_generator = self.step % self.config.dfake_gen_update_ratio == 0
+                self.teacher_service.run_step(train_generator=train_generator)
+
+                barrier()
+                self.step += 1
+
+                max_steps = getattr(self.config, "max_steps", None)
+                if max_steps and self.step >= max_steps:
+                    break
+            return
+
         while True:
             self.train_one_step()
 
