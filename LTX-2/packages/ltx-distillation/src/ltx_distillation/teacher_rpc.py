@@ -18,6 +18,8 @@ _DTYPE_TO_CODE = {
     torch.bool: 5,
 }
 _CODE_TO_DTYPE = {code: dtype for dtype, code in _DTYPE_TO_CODE.items()}
+_OPTIONAL_TENSOR_MAX_NDIM = 8
+_OPTIONAL_TENSOR_HEADER_SIZE = 3 + _OPTIONAL_TENSOR_MAX_NDIM
 
 _REAL_SCORE_REQUEST_KEYS = (
     "noisy_video",
@@ -48,17 +50,34 @@ _CONDITIONING_RESPONSE_KEYS = (
 
 
 def _optional_tensor_header(tensor: Optional[torch.Tensor], device: torch.device) -> torch.Tensor:
-    if tensor is None:
-        return torch.tensor([-1], device=device, dtype=torch.int64)
-
-    dtype_code = _DTYPE_TO_CODE.get(tensor.dtype)
-    if dtype_code is None:
-        raise TypeError(f"Unsupported tensor dtype for teacher RPC: {tensor.dtype}")
-    return torch.tensor(
-        [tensor.dim(), dtype_code, *tensor.shape],
+    header = torch.full(
+        (_OPTIONAL_TENSOR_HEADER_SIZE,),
+        fill_value=-1,
         device=device,
         dtype=torch.int64,
     )
+    if tensor is None:
+        header[0] = 0
+        return header
+
+    if tensor.dim() > _OPTIONAL_TENSOR_MAX_NDIM:
+        raise ValueError(
+            f"Teacher RPC supports tensors with ndim <= {_OPTIONAL_TENSOR_MAX_NDIM}, "
+            f"got ndim={tensor.dim()}"
+        )
+    dtype_code = _DTYPE_TO_CODE.get(tensor.dtype)
+    if dtype_code is None:
+        raise TypeError(f"Unsupported tensor dtype for teacher RPC: {tensor.dtype}")
+    header[0] = 1
+    header[1] = tensor.dim()
+    header[2] = dtype_code
+    if tensor.dim() > 0:
+        header[3: 3 + tensor.dim()] = torch.tensor(
+            list(tensor.shape),
+            device=device,
+            dtype=torch.int64,
+        )
+    return header
 
 
 def _send_optional_tensor(
@@ -69,8 +88,6 @@ def _send_optional_tensor(
     group=None,
 ) -> None:
     header = _optional_tensor_header(tensor, device=device)
-    header_len = torch.tensor([header.numel()], device=device, dtype=torch.int64)
-    dist.send(header_len, dst=dst, group=group)
     dist.send(header, dst=dst, group=group)
     if tensor is not None:
         if tensor.device != device:
@@ -84,18 +101,15 @@ def _recv_optional_tensor(
     device: torch.device,
     group=None,
 ) -> Optional[torch.Tensor]:
-    header_len = torch.empty(1, device=device, dtype=torch.int64)
-    dist.recv(header_len, src=src, group=group)
-    header_numel = int(header_len.cpu().item())
-    header = torch.empty(header_numel, device=device, dtype=torch.int64)
+    header = torch.empty((_OPTIONAL_TENSOR_HEADER_SIZE,), device=device, dtype=torch.int64)
     dist.recv(header, src=src, group=group)
-    if int(header[0].cpu().item()) < 0:
+    if int(header[0].cpu().item()) == 0:
         return None
 
-    ndim = int(header[0].cpu().item())
-    dtype_code = int(header[1].cpu().item())
+    ndim = int(header[1].cpu().item())
+    dtype_code = int(header[2].cpu().item())
     dtype = _CODE_TO_DTYPE[dtype_code]
-    shape = tuple(int(dim) for dim in header[2: 2 + ndim].cpu().tolist())
+    shape = tuple(int(dim) for dim in header[3: 3 + ndim].cpu().tolist())
     tensor = torch.empty(shape, device=device, dtype=dtype)
     dist.recv(tensor, src=src, group=group)
     return tensor

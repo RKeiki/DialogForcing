@@ -424,7 +424,7 @@ class LTX2DiffusionWrapper(nn.Module):
 
         return video_x0, audio_x0
 
-    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True) -> None:
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True) -> Any:
         """Load state dict, handling potential key mismatches."""
         # Remove 'model.' prefix if present
         new_state_dict = {}
@@ -434,7 +434,7 @@ class LTX2DiffusionWrapper(nn.Module):
             else:
                 new_state_dict[f"model.{k}"] = v
 
-        super().load_state_dict(new_state_dict, strict=strict)
+        return super().load_state_dict(new_state_dict, strict=strict)
 
 
 def create_ltx2_wrapper(
