@@ -219,8 +219,14 @@ class Trainer:
             1, int(getattr(config, "layerwise_grad_log_interval", config.log_iters))
         )
         self.previous_time = None
+        self.resume_checkpoint = getattr(config, "resume_checkpoint", None)
 
         if not self.is_worker:
+            if self.resume_checkpoint:
+                ckpt = torch.load(self.resume_checkpoint, map_location="cpu")
+                self.step = ckpt.get("step", 0)
+                if self.global_rank == 0:
+                    print(f"[Resume] Teacher resumed at step {self.step}")
             self.generator_optimizer = None
             self.critic_optimizer = None
             self.generator_scheduler = None
@@ -258,11 +264,10 @@ class Trainer:
         self._init_benchmark_prompts()
 
         # Resume from a causal DMD checkpoint (full state: generator + critic + step)
-        resume_ckpt = getattr(config, "resume_checkpoint", None)
-        if resume_ckpt:
+        if self.resume_checkpoint:
             if self.is_main_process:
-                print(f"[Resume] Loading causal DMD checkpoint from {resume_ckpt}")
-            ckpt = torch.load(resume_ckpt, map_location="cpu")
+                print(f"[Resume] Loading causal DMD checkpoint from {self.resume_checkpoint}")
+            ckpt = torch.load(self.resume_checkpoint, map_location="cpu")
             self.dmd.generator.load_state_dict(ckpt["generator"])
             self.dmd.fake_score.load_state_dict(ckpt["critic"])
             self.step = ckpt.get("step", 0)
